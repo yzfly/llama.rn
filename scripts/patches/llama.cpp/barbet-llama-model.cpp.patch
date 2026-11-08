@@ -1,9 +1,9 @@
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -238,6 +238,8 @@
-             return new llama_model_nemotron_h(params);
-         case LLM_ARCH_NEMOTRON_H_MOE:
+@@ -243,6 +243,8 @@
              return new llama_model_nemotron_h_moe(params);
+         case LLM_ARCH_METIS16:
+             return new llama_model_metis16(params);
 +        case LLM_ARCH_BARBET:
 +            return new llama_model_barbet(params);
          case LLM_ARCH_EXAONE:

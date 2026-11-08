@@ -7,12 +7,12 @@ base_compiler_flags = "-fno-objc-arc -fvisibility-inlines-hidden -DGGML_USE_CPU 
 if ENV["RNLLAMA_DISABLE_METAL"] != "1" then
   # GGMLMetalClass only exists when GGML_METAL_EMBED_LIBRARY is off; keep the
   # (process-global) Objective-C class name unique per library regardless.
-  base_compiler_flags += " -DGGML_USE_METAL -DGGML_METAL_EMBED_LIBRARY=1 -DGGMLMetalClass=RNLlamaGGMLMetalClass" # -DGGML_METAL_NDEBUG
+  base_compiler_flags += " -DGGML_USE_METAL -DGGMLMetalClass=RNLlamaGGMLMetalClass" # -DGGML_METAL_NDEBUG
 end
 
 # Use base_optimizer_flags = "" for debug builds
 # base_optimizer_flags = ""
-base_optimizer_flags = "-O3 -DNDEBUG -funroll-loops"
+base_optimizer_flags = "-O3 -DNDEBUG"
 
 if ENV["RNLLAMA_NATIVE_CPU"] == "1" then
   apple_cpu_flags = ENV["RNLLAMA_NATIVE_CPU_FLAGS"] || "-Xarch_arm64 -mcpu=apple-m2"
@@ -44,7 +44,7 @@ Pod::Spec.new do |s|
       "#{llama_cpp}/ggml/include/*.h",
       "#{llama_cpp}/ggml/src/*.{h,c,cpp}",
       "#{llama_cpp}/ggml/src/ggml-cpu/**/*.{h,c,cpp}",
-      "#{llama_cpp}/ggml/src/ggml-metal/*.{h,m,cpp,s}",
+      "#{llama_cpp}/ggml/src/ggml-metal/*.{h,m,cpp}",
       "#{llama_cpp}/ggml/src/ggml-blas/*.{h,cpp}",
       "#{llama_cpp}/common/**/*.{h,cpp}",
       "#{llama_cpp}/tools/mtmd/**/*.{h,cpp}",

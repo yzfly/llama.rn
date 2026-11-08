@@ -13,11 +13,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -56,6 +58,10 @@ static void log(LogLevel level, const char* format, ...) {
 #define logDebug(format, ...) log(LogLevel::LOG_DEBUG, format, ##__VA_ARGS__)
 
 static std::once_flag backend_init_once;
+
+extern "C" __attribute__((visibility("default"), used)) int rnllama_jsi_patch_ownership_v3(void) {
+    return 1;
+}
 
 #if defined(__ANDROID__)
 static bool shouldExcludeHexagonDevice(ggml_backend_dev_t dev) {
@@ -188,6 +194,7 @@ namespace rnllama_jsi {
     // beginCompletion(), see #403).
     class ContextClaim {
     public:
+        explicit ContextClaim(const ContextRef& ctx) : ContextClaim(ctx.get()) {}
         explicit ContextClaim(rnllama::llama_rn_context* ctx) : ctx_(ctx) {
             bool expected = false;
             if (!ctx_->is_claimed.compare_exchange_strong(expected, true)) {
@@ -222,6 +229,27 @@ namespace rnllama_jsi {
         ContextClaim(rnllama::llama_rn_context* ctx, AdoptTag) : ctx_(ctx) {}
 
         rnllama::llama_rn_context* ctx_;
+    };
+
+    // Ends a completion on every exit, so a throw from the token loop does not
+    // leave the context marked as predicting
+    class CompletionScope {
+    public:
+        explicit CompletionScope(rnllama::llama_rn_context_completion* completion) : completion_(completion) {}
+        CompletionScope(const CompletionScope&) = delete;
+        CompletionScope& operator=(const CompletionScope&) = delete;
+
+        ~CompletionScope() {
+            if (completion_) completion_->endCompletion();
+        }
+
+        void end() {
+            completion_->endCompletion();
+            completion_ = nullptr;
+        }
+
+    private:
+        rnllama::llama_rn_context_completion* completion_;
     };
 
     static void ensureBackendInitialized() {
@@ -526,20 +554,40 @@ namespace rnllama_jsi {
         }
     }
 
-    void addContext(int contextId, long contextPtr) {
-        g_llamaContexts.add(contextId, contextPtr);
-    }
-
-    void removeContext(int contextId) {
-        g_llamaContexts.remove(contextId);
-    }
-
-    rnllama::llama_rn_context* getContextOrThrow(int contextId) {
-        long ctxPtr = g_llamaContexts.get(contextId);
-        if (!ctxPtr) {
+    static ContextRef getContextOrThrow(int contextId) {
+        auto ctx = g_llamaContexts.get(contextId);
+        if (!ctx) {
             throw std::runtime_error("Context not found");
         }
-        return reinterpret_cast<rnllama::llama_rn_context*>(ctxPtr);
+        return ctx;
+    }
+
+    // Called once the context is out of the registry, so no new task can reach it.
+    static void stopForRelease(const ContextRef& ctx) {
+        ctx->releasing = true;
+        if (ctx->completion) {
+            ctx->completion->is_interrupted = true;
+        }
+        if (ctx->slot_manager) {
+            ctx->slot_manager->stop_processing_loop();
+        }
+    }
+
+    // A task may still hold the context; it is destroyed only by its last owner
+    // here, never under a running task.
+    static void destroyWhenSoleOwner(ContextRef ctx) {
+        // A long wait means a task ignored the interrupt or a reference leaked;
+        // say so once instead of hanging silently
+        const auto warn_at = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        bool warned = false;
+        while (ctx.use_count() > 1) {
+            if (!warned && std::chrono::steady_clock::now() >= warn_at) {
+                logError("releaseContext: still waiting for %ld other owner(s) of the context", (long) ctx.use_count() - 1);
+                warned = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ctx.reset();
     }
 
     void installJSIBindings(
@@ -732,7 +780,8 @@ namespace rnllama_jsi {
                              }
                          }
 
-                         addContext(contextId, (long)ctx);
+                         ContextRef ctxRef(ctx);
+                         g_llamaContexts.add(contextId, ctxRef);
 
                          std::string androidLibName = "";
                          #if defined(__ANDROID__)
@@ -743,7 +792,7 @@ namespace rnllama_jsi {
                              {"reasonNoGPU", reasonNoGPU},
                              {"systemInfo", common_params_get_system_info(ctx->params)},
                              // Model metadata and chat template capabilities
-                             {"model", modelDetailsJson(ctx)},
+                             {"model", modelDetailsJson(ctxRef.get())},
                              {"devices", usedDevices},
                              {"androidLib", androidLibName},
                          });
@@ -811,7 +860,7 @@ namespace rnllama_jsi {
                 return createPromiseTask(runtime, callInvoker, [contextId, path]() -> PromiseResultGenerator {
                     auto ctx = getContextOrThrow(contextId);
                     ContextClaim claim(ctx);
-                    json result = rnllama_jsi::loadSession(ctx, path);
+                    json result = rnllama_jsi::loadSession(ctx.get(), path);
                     return [result](jsi::Runtime& rt) {
                         return fromJson(rt, result);
                     };
@@ -831,7 +880,7 @@ namespace rnllama_jsi {
                 return createPromiseTask(runtime, callInvoker, [contextId, path, size]() -> PromiseResultGenerator {
                     auto ctx = getContextOrThrow(contextId);
                     ContextClaim claim(ctx);
-                    int tokens_saved = rnllama_jsi::saveSession(ctx, path, size);
+                    int tokens_saved = rnllama_jsi::saveSession(ctx.get(), path, size);
                     return [tokens_saved](jsi::Runtime& rt) {
                         return jsi::Value(tokens_saved);
                     };
@@ -1122,7 +1171,7 @@ namespace rnllama_jsi {
                 ContextClaim claim(ctx);
                 ctx->completion->rewind();
 
-                parseCompletionParams(params, ctx);
+                parseCompletionParams(params, ctx.get());
 
                 std::vector<std::string> mediaPaths;
                 // media_paths: string | string[]
@@ -1147,7 +1196,7 @@ namespace rnllama_jsi {
 
                 jsi::Value promise = createPromiseTask(runtime, callInvoker, [runtimePtr = std::shared_ptr<jsi::Runtime>(&runtime, [](jsi::Runtime*){}), contextId, onToken, emitPartial, mediaPaths, chat_format, reasoning_format, generation_prompt, chat_parser, prefill_text, callInvoker]() -> PromiseResultGenerator {
                     auto ctx = getContextOrThrow(contextId);
-                    auto claim = ContextClaim::adopt(ctx);
+                    auto claim = ContextClaim::adopt(ctx.get());
 
                     if (ctx->completion == nullptr) {
                         throw std::runtime_error("Completion not initialized");
@@ -1187,6 +1236,7 @@ namespace rnllama_jsi {
 
                     size_t sent_count = 0;
 
+                    CompletionScope completionScope(ctx->completion);
                     while (ctx->completion->has_next_token && !ctx->completion->is_interrupted) {
                         const rnllama::completion_token_output token_with_probs = ctx->completion->doCompletion();
                         if (token_with_probs.tok == -1 || ctx->completion->incomplete) {
@@ -1228,7 +1278,7 @@ namespace rnllama_jsi {
 
                                 auto runtime = runtimePtr;
                                 if (runtime) {
-                                    json tokenResult = tokenResultJson(ctx, output_copy);
+                                    json tokenResult = tokenResultJson(ctx.get(), output_copy);
                                     if (has_partial_output) {
                                         addChatOutputFields(tokenResult, partial_output);
                                     }
@@ -1246,10 +1296,10 @@ namespace rnllama_jsi {
                     }
 
                     common_perf_print(ctx->ctx, ctx->completion->ctx_sampling);
-                    ctx->completion->endCompletion();
+                    completionScope.end();
 
                     // Snapshot the result here, before another task can touch the context
-                    CompletionResult result = completionResult(ctx);
+                    CompletionResult result = completionResult(ctx.get());
 
                     return [contextId, result](jsi::Runtime& rt) -> jsi::Value {
                         if (!g_llamaContexts.get(contextId)) {
@@ -1363,7 +1413,7 @@ namespace rnllama_jsi {
                     throw jsi::JSError(runtime, "This model only answers decisions, see decide()");
                 }
                 auto originalParams = ctxPtr->params;
-                parseCompletionParams(params, ctxPtr);
+                parseCompletionParams(params, ctxPtr.get());
                 common_params cparams = ctxPtr->params;
                 ctxPtr->params = originalParams;
 
@@ -1402,7 +1452,14 @@ namespace rnllama_jsi {
                     auto tokenizeResult = ctx->tokenize(cparams.prompt, mediaPaths);
                     std::vector<llama_token> tokens = tokenizeResult.tokens;
 
-                    auto tokenCallback = [contextId, callInvoker, ctx, runtimePtr](const rnllama::completion_token_output& token) {
+                    // The slot manager that stores this callback is owned by the context,
+                    // so a strong reference here would keep the context alive forever.
+                    std::weak_ptr<rnllama::llama_rn_context> weakCtx = ctx;
+                    auto tokenCallback = [contextId, callInvoker, weakCtx, runtimePtr](const rnllama::completion_token_output& token) {
+                        auto ctx = weakCtx.lock();
+                        if (!ctx) {
+                            return;
+                        }
                         int requestId = token.request_id;
                         rnllama::completion_chat_output parsed_output;
                         bool has_parsed_output = false;
@@ -1420,7 +1477,7 @@ namespace rnllama_jsi {
 
                         auto callbacks = RequestManager::getInstance().getRequest(contextId, requestId);
                         if (callbacks.onToken) {
-                            json tokenResult = tokenResultJson(ctx, token);
+                            json tokenResult = tokenResultJson(ctx.get(), token);
                             if (has_parsed_output) {
                                 addChatOutputFields(tokenResult, parsed_output);
                             }
@@ -1496,7 +1553,7 @@ namespace rnllama_jsi {
                     if (result == rnllama::llama_rn_cancel_result::QUEUED) {
                         auto callbacks = RequestManager::getInstance().takeRequest(contextId, requestId);
                         if (callbacks.onComplete) {
-                            json response = parallelCompletionResultJson(ctx, createQueuedCancellationSnapshot(requestId));
+                            json response = parallelCompletionResultJson(ctx.get(), createQueuedCancellationSnapshot(requestId));
                             callbacks.onComplete->call(runtime, fromJson(runtime, response));
                         }
                     }
@@ -1756,12 +1813,9 @@ namespace rnllama_jsi {
                 int contextId = (int)arguments[0].asNumber();
                 int subscriberId = (int)arguments[1].asNumber();
 
-                long ctxPtr = g_llamaContexts.get(contextId);
-                if (ctxPtr) {
-                    auto ctx = reinterpret_cast<rnllama::llama_rn_context*>(ctxPtr);
-                    if (ctx->slot_manager) {
-                        ctx->slot_manager->remove_status_subscriber(subscriberId);
-                    }
+                auto ctx = g_llamaContexts.get(contextId);
+                if (ctx && ctx->slot_manager) {
+                    ctx->slot_manager->remove_status_subscriber(subscriberId);
                 }
 
                 return jsi::Value::undefined();
@@ -1776,33 +1830,17 @@ namespace rnllama_jsi {
                  int contextId = (int)arguments[0].asNumber();
                  return createPromiseTask(runtime, callInvoker, [contextId]() -> PromiseResultGenerator {
                      RequestManager::getInstance().clearContext(contextId);
-                     long ctxPtr = g_llamaContexts.get(contextId);
-                     if (ctxPtr) {
-                         auto ctx = reinterpret_cast<rnllama::llama_rn_context*>(ctxPtr);
-                         if (ctx->completion) {
-                             ctx->completion->is_interrupted = true;
-                         }
-                         if (ctx->slot_manager) {
-                             ctx->slot_manager->stop_processing_loop();
-                         }
+                     auto ctx = g_llamaContexts.take(contextId);
+                     if (ctx) {
+                         stopForRelease(ctx);
                      }
 
-                     // Wait for ALL other tasks on this context to complete (including their
-                     // invokeAsync callbacks) before deleting. This prevents race conditions
-                     // where we delete the context while a completion's JS callback is still
-                     // accessing ctx->completion.
-                     TaskManager::getInstance().waitForContext(contextId, 0);
                      if (TaskManager::getInstance().isShuttingDown()) {
                          return [](jsi::Runtime& rt) { return jsi::Value::undefined(); };
                      }
 
-                     if (ctxPtr) {
-                         auto ctx = reinterpret_cast<rnllama::llama_rn_context*>(ctxPtr);
-                         // Remove from map FIRST, then delete.
-                         // This ensures any concurrent lookups via g_llamaContexts.get()
-                         // will return 0 (not found) rather than a dangling pointer.
-                         removeContext(contextId);
-                         delete ctx;
+                     if (ctx) {
+                         destroyWhenSoleOwner(std::move(ctx));
                      }
                      return [](jsi::Runtime& rt) { return jsi::Value::undefined(); };
                  }, contextId, false);  // trackTask=false - release should not count itself
@@ -1817,33 +1855,18 @@ namespace rnllama_jsi {
                  return createPromiseTask(runtime, callInvoker, []() -> PromiseResultGenerator {
                      RequestManager::getInstance().clearAll();
 
-                     auto contexts = g_llamaContexts.snapshot();
-                     for (const auto& entry : contexts) {
-                         long ctxPtr = entry.second;
-                         if (!ctxPtr) {
-                             continue;
-                         }
-                         auto ctx = reinterpret_cast<rnllama::llama_rn_context*>(ctxPtr);
-                         if (ctx->completion) {
-                             ctx->completion->is_interrupted = true;
-                         }
-                         if (ctx->slot_manager) {
-                             ctx->slot_manager->stop_processing_loop();
-                         }
+                     auto contexts = g_llamaContexts.takeAll();
+                     for (const auto& ctx : contexts) {
+                         stopForRelease(ctx);
                      }
 
-                     // Wait for ALL tasks to complete (including their invokeAsync callbacks)
-                     TaskManager::getInstance().waitForAll(0);
                      if (TaskManager::getInstance().isShuttingDown()) {
                          return [](jsi::Runtime& rt) { return jsi::Value::undefined(); };
                      }
 
-                     g_llamaContexts.clear([](long ptr) {
-                        if (ptr) {
-                            auto ctx = reinterpret_cast<rnllama::llama_rn_context*>(ptr);
-                            delete ctx;
-                        }
-                     });
+                     for (auto& ctx : contexts) {
+                         destroyWhenSoleOwner(std::move(ctx));
+                     }
                      return [](jsi::Runtime& rt) { return jsi::Value::undefined(); };
                  }, -1, false);  // contextId=-1 (not tracked), trackTask=false
             }
@@ -2040,7 +2063,7 @@ namespace rnllama_jsi {
                     if (!ctx->isVocoderEnabled()) throw std::runtime_error("Vocoder is not enabled");
 
                     try {
-                        auto audio_result = ctx->tts_wrapper->getFormattedAudioCompletion(ctx, speaker, textToSpeak, speakerId);
+                        auto audio_result = ctx->tts_wrapper->getFormattedAudioCompletion(ctx.get(), speaker, textToSpeak, speakerId);
                         json res = json::object({{"prompt", audio_result.prompt}});
                         if (!audio_result.grammar.empty()) {
                             res["grammar"] = audio_result.grammar;
@@ -2066,7 +2089,7 @@ namespace rnllama_jsi {
                 return createPromiseTask(runtime, callInvoker, [contextId]() -> PromiseResultGenerator {
                     auto ctx = getContextOrThrow(contextId);
                     if (!ctx->isVocoderEnabled()) throw std::runtime_error("Vocoder is not enabled");
-                    auto cap = ctx->tts_wrapper->getTTSCapabilities(ctx);
+                    auto cap = ctx->tts_wrapper->getTTSCapabilities(ctx.get());
                     json res = json::object({
                         {"type", cap.type},
                         {"promptKind", cap.prompt_kind},
@@ -2095,7 +2118,7 @@ namespace rnllama_jsi {
                     if (!ctx->isVocoderEnabled()) throw std::runtime_error("Vocoder is not enabled");
 
                     try {
-                        auto audio_data = ctx->tts_wrapper->decodeAudioTokens(ctx, tokens);
+                        auto audio_data = ctx->tts_wrapper->decodeAudioTokens(ctx.get(), tokens);
                         return [audio_data](jsi::Runtime& rt) {
                             return makeFloat32Array(rt, audio_data);
                         };
@@ -2158,7 +2181,7 @@ namespace rnllama_jsi {
                     }
 
                     try {
-                        auto r = ctx->tts_wrapper->generateAudioCodes(ctx, opts, cb);
+                        auto r = ctx->tts_wrapper->generateAudioCodes(ctx.get(), opts, cb);
                         json res = json::object({
                             {"codes", r.codes},
                             {"nCodebook", r.n_codebook},
@@ -2195,14 +2218,14 @@ namespace rnllama_jsi {
                     auto ctx = getContextOrThrow(contextId);
                     if (!ctx->isVocoderEnabled()) throw std::runtime_error("Vocoder is not enabled");
 
-                    auto cap = ctx->tts_wrapper->getTTSCapabilities(ctx);
+                    auto cap = ctx->tts_wrapper->getTTSCapabilities(ctx.get());
                     std::string family = cap.family;
 
                     // Without an explicit emotion the speaker keeps rn_speaker's
                     // default; the encoder only reads it when has_emotion is set.
                     const bool has_emotion = opts.hasEmotion();
                     const int speakerId = ctx->tts_wrapper->createSpeaker(
-                        ctx, pcm, opts.inputSampleRate, opts.refText,
+                        ctx.get(), pcm, opts.inputSampleRate, opts.refText,
                         has_emotion ? opts.emotion : 0.5f, has_emotion, opts.bake);
 
                     const rnllama::rn_speaker * spk = ctx->tts_wrapper->getSpeaker(speakerId);
@@ -2234,7 +2257,7 @@ namespace rnllama_jsi {
                     auto ctx = getContextOrThrow(contextId);
                     if (!ctx->isVocoderEnabled()) throw std::runtime_error("Vocoder is not enabled");
 
-                    ctx->tts_wrapper->bakeSpeaker(ctx, speakerId);
+                    ctx->tts_wrapper->bakeSpeaker(ctx.get(), speakerId);
 
                     const rnllama::rn_speaker * spk = ctx->tts_wrapper->getSpeaker(speakerId);
                     if (!spk) throw std::runtime_error("bakeSpeaker: speaker id not found");
@@ -2283,7 +2306,7 @@ namespace rnllama_jsi {
                     if (!ctx->isVocoderEnabled()) throw std::runtime_error("Vocoder is not enabled");
 
                     try {
-                        auto audio_data = ctx->tts_wrapper->decodeAudioEmbeddings(ctx, embeddings, embeddingDim);
+                        auto audio_data = ctx->tts_wrapper->decodeAudioEmbeddings(ctx.get(), embeddings, embeddingDim);
                         return [audio_data](jsi::Runtime& rt) {
                             return makeFloat32Array(rt, audio_data);
                         };
@@ -2358,19 +2381,9 @@ namespace rnllama_jsi {
         llama_log_set(llama_log_callback_default, nullptr);
 
         RequestManager::getInstance().clearAll();
-        auto contexts = g_llamaContexts.snapshot();
-        for (const auto& entry : contexts) {
-            long ctxPtr = entry.second;
-            if (!ctxPtr) {
-                continue;
-            }
-            auto ctx = reinterpret_cast<rnllama::llama_rn_context*>(ctxPtr);
-            if (ctx->completion) {
-                ctx->completion->is_interrupted = true;
-            }
-            if (ctx->slot_manager) {
-                ctx->slot_manager->stop_processing_loop();
-            }
+        auto contexts = g_llamaContexts.takeAll();
+        for (const auto& ctx : contexts) {
+            stopForRelease(ctx);
         }
 
         if (contexts.empty()) {
@@ -2379,12 +2392,9 @@ namespace rnllama_jsi {
         }
         ThreadPool::getInstance().shutdown();
 
-        g_llamaContexts.clear([](long ptr) {
-            if (ptr) {
-                auto ctx = reinterpret_cast<rnllama::llama_rn_context*>(ptr);
-                delete ctx;
-            }
-        });
+        for (auto& ctx : contexts) {
+            destroyWhenSoleOwner(std::move(ctx));
+        }
         g_context_limit.store(-1);
     }
 }

@@ -32,13 +32,17 @@ public class RNLlama {
   };
   private static final Pattern QUALCOMM_HINT_PATTERN =
     Pattern.compile("(adreno|qcom|qualcomm|snapdragon)", Pattern.CASE_INSENSITIVE);
+  // Only SoCs whose cDSP is Hexagon v73 or newer: the bundled skels are
+  // libggml-htp-v73..v85, and loading them on v69 (SM8450 / 8 Gen 1) aborts
+  // the process (upstream pocketpal-ai#960).
   private static final Pattern KNOWN_HEXAGON_SOC_PATTERN =
-    Pattern.compile("\\b(SM8450|SM8550|SM8635|SM8650|SM8750|SM8845|SM8850)\\b");
+    Pattern.compile("\\b(SM8550|SM8635|SM8650|SM8735|SM8750|SM8845|SM8850|SM7675)\\b");
+  private static final Pattern SNAPDRAGON_8_SERIES_NUMBER_PATTERN = Pattern.compile("\\bSM8(\\d{3})\\b");
+  private static final int MIN_HEXAGON_V73_SM8_NUMBER = 550;
   private static final Pattern SNAPDRAGON_8_SERIES_SOC_PATTERN = Pattern.compile("\\bSM8\\d{3}\\b");
-  private static final Pattern SNAPDRAGON_8_SERIES_NAME_PATTERN =
-    Pattern.compile("SNAPDRAGON\\s*8");
+  private static final Pattern SM_MODEL_ID_PATTERN = Pattern.compile("\\bSM\\d{4}\\b");
   private static final Pattern HEXAGON_CODENAME_PATTERN =
-    Pattern.compile("(taro|kalama|pineapple|sun|lanai)");
+    Pattern.compile("(kalama|pineapple|sun|lanai)");
 
   private final ReactApplicationContext reactContext;
 
@@ -369,10 +373,14 @@ public class RNLlama {
         if (KNOWN_HEXAGON_SOC_PATTERN.matcher(socModel).find()) {
           return true;
         }
-        if (hasQualcommHint &&
-            (SNAPDRAGON_8_SERIES_SOC_PATTERN.matcher(socModel).find() ||
-             SNAPDRAGON_8_SERIES_NAME_PATTERN.matcher(socModel).find())) {
-          return true;
+        java.util.regex.Matcher sm8 = SNAPDRAGON_8_SERIES_NUMBER_PATTERN.matcher(socModel);
+        if (hasQualcommHint && sm8.find()) {
+          // Newer SM8 parts (8 Gen 2 = SM8550 onwards) all ship v73+.
+          return Integer.parseInt(sm8.group(1)) >= MIN_HEXAGON_V73_SM8_NUMBER;
+        }
+        // A Qualcomm model id that is not v73+: do not guess from codenames.
+        if (SM_MODEL_ID_PATTERN.matcher(socModel).find()) {
+          return false;
         }
       }
     }
